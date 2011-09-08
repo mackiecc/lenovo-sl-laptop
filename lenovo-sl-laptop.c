@@ -37,7 +37,6 @@
 #include <linux/hwmon-sysfs.h>
 #include <linux/backlight.h>
 #include <linux/platform_device.h>
-#include <linux/delay.h>
 
 #include <linux/input.h>
 #include <linux/kthread.h>
@@ -524,178 +523,6 @@ static int radio_init(lensl_radio_type type)
 }
 
 /*************************************************************************
-    backlight control - based on video.c
- *************************************************************************/
-
-/* NB: the reason why this needs to be implemented here is that the SL series
-   uses the ACPI interface for controlling the backlight in a non-standard
-   manner. See http://bugzilla.kernel.org/show_bug.cgi?id=12249  */
-
-static acpi_handle lcdd_handle;
-static struct backlight_device *backlight;
-static struct lensl_vector {
-	int count;
-	int *values;
-} backlight_levels;
-
-static int get_bcl(struct lensl_vector *levels)
-{
-	int i, status;
-	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	union acpi_object *o, *obj;
-
-	if (!levels)
-		return -EINVAL;
-	if (levels->count) {
-		levels->count = 0;
-		kfree(levels->values);
-	}
-
-	/* _BCL returns an array sorted from high to low; the first two values
-	   are *not* special (non-standard behavior) */
-	status = acpi_evaluate_object(lcdd_handle, "_BCL", NULL, &buffer);
-	if (!ACPI_SUCCESS(status))
-		return status;
-	obj = (union acpi_object *)buffer.pointer;
-	if (!obj || (obj->type != ACPI_TYPE_PACKAGE)) {
-		vdbg_printk(LENSL_ERR, "Invalid _BCL data\n");
-		status = -EFAULT;
-		goto out;
-	}
-
-	levels->count = obj->package.count;
-	if (!levels->count)
-		goto out;
-	levels->values = kmalloc(levels->count * sizeof(int), GFP_KERNEL);
-	if (!levels->values) {
-		vdbg_printk(LENSL_ERR,
-			"Failed to allocate memory for brightness levels\n");
-		status = -ENOMEM;
-		goto out;
-	}
-
-	for (i = 0; i < obj->package.count; i++) {
-		o = (union acpi_object *)&obj->package.elements[i];
-		if (o->type != ACPI_TYPE_INTEGER) {
-			vdbg_printk(LENSL_ERR, "Invalid brightness data\n");
-			goto err;
-		}
-		levels->values[i] = (int) o->integer.value;
-	}
-	goto out;
-
-err:
-	levels->count = 0;
-	kfree(levels->values);
-
-out:
-	kfree(buffer.pointer);
-
-	return status;
-}
-
-static inline int set_bcm(int level)
-{
-	/* standard behavior */
-	return lensl_acpi_int_func(lcdd_handle, "_BCM", NULL, 1, level);
-}
-
-static inline int get_bqc(int *level)
-{
-	/* returns an index from the bottom into the _BCL package
-	   (non-standard behavior) */
-	return lensl_acpi_int_func(lcdd_handle, "_BQC", level, 0);
-}
-
-/* backlight device sysfs support */
-static int lensl_bd_get_brightness(struct backlight_device *bd)
-{
-	int level = 0;
-
-	if (get_bqc(&level))
-		return 0;
-
-	return level;
-}
-
-static int lensl_bd_set_brightness_int(int request_level)
-{
-	int n;
-	n = backlight_levels.count - request_level - 1;
-	if (n >= 0 && n < backlight_levels.count)
-		return set_bcm(backlight_levels.values[n]);
-
-	return -EINVAL;
-}
-
-static int lensl_bd_set_brightness(struct backlight_device *bd)
-{
-	if (!bd)
-		return -EINVAL;
-
-	return lensl_bd_set_brightness_int(bd->props.brightness);
-}
-
-static struct backlight_ops lensl_backlight_ops = {
-	.get_brightness = lensl_bd_get_brightness,
-	.update_status  = lensl_bd_set_brightness,
-};
-
-static void backlight_exit(void)
-{
-	backlight_device_unregister(backlight);
-	backlight = NULL;
-	if (backlight_levels.count) {
-		kfree(backlight_levels.values);
-		backlight_levels.count = 0;
-	}
-}
-
-static int backlight_init(void)
-{
-	int status = 0;
-	struct backlight_properties props;
-
-	lcdd_handle = NULL;
-	backlight = NULL;
-	backlight_levels.count = 0;
-	backlight_levels.values = NULL;
-
-	status = acpi_get_handle(NULL, LENSL_LCDD, &lcdd_handle);
-	if (ACPI_FAILURE(status)) {
-		vdbg_printk(LENSL_ERR,
-			"Failed to get ACPI handle for %s\n", LENSL_LCDD);
-		return -EIO;
-	}
-
-	status = get_bcl(&backlight_levels);
-	if (status || !backlight_levels.count)
-		goto err;
-
-	memset(&props, 0, sizeof(struct backlight_properties));
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,34)
-	backlight = backlight_device_register(LENSL_BACKLIGHT_NAME,
-			NULL, NULL, &lensl_backlight_ops, &props);
-#else
-	backlight = backlight_device_register(LENSL_BACKLIGHT_NAME,
-			NULL, NULL, &lensl_backlight_ops);
-#endif
-	backlight->props.max_brightness = backlight_levels.count - 1;
-	backlight->props.brightness = lensl_bd_get_brightness(backlight);
-	vdbg_printk(LENSL_INFO, "Started backlight brightness control\n");
-	goto out;
-err:
-	if (backlight_levels.count) {
-		kfree(backlight_levels.values);
-		backlight_levels.count = 0;
-	}
-	vdbg_printk(LENSL_ERR,
-		"Failed to start backlight brightness control\n");
-out:
-	return status;
-}
-
-/*************************************************************************
     LEDs
  *************************************************************************/
 
@@ -1047,26 +874,13 @@ static int ec_scancode_to_keycode(u8 scancode)
 	return -EINVAL;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-static int hkey_inputdev_getkeycode(struct input_dev *dev,
-                                    struct input_keymap_entry *ke)
-#else
 static int hkey_inputdev_getkeycode(struct input_dev *dev, int scancode,
 					int *keycode)
-#endif
 {
 	int result;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-    u8 scancode;
-    u32 *keycode;
-#endif
+
 	if (!dev)
 		return -EINVAL;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-    scancode = ke->scancode[0];
-    keycode = &(ke->keycode);
-#endif
 
 	result = ec_scancode_to_keycode(scancode);
 	if (result >= 0) {
@@ -1076,14 +890,8 @@ static int hkey_inputdev_getkeycode(struct input_dev *dev, int scancode,
 	return result;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-static int hkey_inputdev_setkeycode(struct input_dev *dev,
-                                    const struct input_keymap_entry *ke,
-                                    unsigned int *oldkeycode)
-#else
 static int hkey_inputdev_setkeycode(struct input_dev *dev, int scancode,
 					int keycode)
-#endif
 {
 	struct key_entry *key;
 
@@ -1091,17 +899,9 @@ static int hkey_inputdev_setkeycode(struct input_dev *dev, int scancode,
 		return -EINVAL;
 
 	for (key = ec_keymap; key->type != KE_END; key++)
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-        if (ke->scancode[0] == key->scancode) {
-#else
 		if (scancode == key->scancode) {
-#endif
 			clear_bit(key->keycode, dev->keybit);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
-			key->keycode = ke->keycode;
-#else
 			key->keycode = keycode;
-#endif
 			set_bit(key->keycode, dev->keybit);
 			return 0;
 		}
@@ -1127,96 +927,6 @@ static int hkey_ec_get_offset(void)
 	if (offset > 7)
 		return -EINVAL;
 	return offset;
-}
-
-static int hkey_poll_kthread(void *data)
-{
-	unsigned long t = 0;
-	int offset, level;
-	unsigned int keycode;
-	u8 scancode;
-
-	mutex_lock(&hkey_poll_mutex);
-
-	offset = hkey_ec_get_offset();
-	if (offset < 0) {
-		vdbg_printk(LENSL_WARNING,
-			"Failed to read hotkey register offset from EC\n");
-		hkey_ec_prev_offset = 0;
-	} else
-		hkey_ec_prev_offset = offset;
-
-	while (!kthread_should_stop() && hkey_poll_hz) {
-		if (t == 0)
-			t = 1000/hkey_poll_hz;
-		t = msleep_interruptible(t);
-		if (unlikely(kthread_should_stop()))
-			break;
-		try_to_freeze();
-		if (t > 0)
-			continue;
-		offset = hkey_ec_get_offset();
-		if (offset < 0) {
-			vdbg_printk(LENSL_WARNING,
-			   "Failed to read hotkey register offset from EC\n");
-			continue;
-		}
-		if (offset == hkey_ec_prev_offset)
-			continue;
-
-		if (ec_read(0x0A + offset, &scancode)) {
-			vdbg_printk(LENSL_WARNING,
-				"Failed to read hotkey code from EC\n");
-			continue;
-		}
-		keycode = ec_scancode_to_keycode(scancode);
-		vdbg_printk(LENSL_DEBUG,
-		   "Got hotkey keycode %d (scancode %d)\n", keycode, scancode);
-
-		/* Special handling for brightness keys. We do it here and not
-		   via an ACPI notifier in order to prevent possible conflicts
-		   with video.c */
-		if (keycode == KEY_BRIGHTNESSDOWN) {
-			if (control_backlight && backlight) {
-				level = lensl_bd_get_brightness(backlight);
-				if (0 <= --level)
-					lensl_bd_set_brightness_int(level);
-			} else
-				keycode = KEY_RESERVED;
-		} else if (keycode == KEY_BRIGHTNESSUP) {
-			if (control_backlight && backlight) {
-				level = lensl_bd_get_brightness(backlight);
-				if (backlight_levels.count > ++level)
-					lensl_bd_set_brightness_int(level);
-			} else
-				keycode = KEY_RESERVED;
-		}
-
-		if (keycode != KEY_RESERVED) {
-			input_report_key(hkey_inputdev, keycode, 1);
-			input_sync(hkey_inputdev);
-			input_report_key(hkey_inputdev, keycode, 0);
-			input_sync(hkey_inputdev);
-		}
-		hkey_ec_prev_offset = offset;
-	}
-
-	mutex_unlock(&hkey_poll_mutex);
-	return 0;
-}
-
-static void hkey_poll_start(void)
-{
-	hkey_ec_prev_offset = 0;
-	mutex_lock(&hkey_poll_mutex);
-	hkey_poll_task = kthread_run(hkey_poll_kthread,
-		NULL, LENSL_HKEY_POLL_KTHREAD_NAME);
-	if (IS_ERR(hkey_poll_task)) {
-		hkey_poll_task = NULL;
-		vdbg_printk(LENSL_ERR,
-			"Could not create kernel thread for hotkey polling\n");
-	}
-	mutex_unlock(&hkey_poll_mutex);
 }
 
 static void hkey_poll_stop(void)
@@ -1374,11 +1084,6 @@ static int __init lenovo_sl_laptop_init(void)
 	int ret;
 	acpi_status status;
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,28)
-	if (!acpi_video_backlight_support())
-		control_backlight = 1;
-#endif
-
 	hkey_handle = ec0_handle = NULL;
 
 	if (acpi_disabled)
@@ -1419,12 +1124,9 @@ static int __init lenovo_sl_laptop_init(void)
 	radio_init(LENSL_BLUETOOTH);
 	radio_init(LENSL_WWAN);
 	radio_init(LENSL_UWB);
-	if (control_backlight)
-		backlight_init();
 
 	led_init();
 	mutex_init(&hkey_poll_mutex);
-	hkey_poll_start();
 	hwmon_init();
 
 	if (debug_ec)
@@ -1440,7 +1142,6 @@ static void __exit lenovo_sl_laptop_exit(void)
 	hwmon_exit();
 	hkey_poll_stop();
 	led_exit();
-	backlight_exit();
 	radio_exit(LENSL_UWB);
 	radio_exit(LENSL_WWAN);
 	radio_exit(LENSL_BLUETOOTH);
